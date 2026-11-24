@@ -27,6 +27,23 @@ import pygame
 W, H = 1280, 720
 DEFAULT_PORT = 5555
 NECK_H, SHOULDER_H = 54, 50
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".stickman_power.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+    except OSError:
+        pass
 
 # Paleta
 BG_TOP, BG_BOT = (12, 15, 24), (24, 28, 44)
@@ -220,9 +237,12 @@ class App:
         self.user, self.stats = None, {}
         self.modes_info, self.last_modes_poll = [], 0.0
         self.ranking, self.rank_mode = [], "all"
-        host = host_arg or os.environ.get("HEADSHOT_HOST", "127.0.0.1")
-        self.boxes = [TextBox((440, 250, 400, 48), "Servidor", host),
-                      TextBox((440, 340, 400, 48), "Usuario", "", maxlen=16),
+        cfg = load_config()
+        host = host_arg or os.environ.get("HEADSHOT_HOST") or cfg.get("host") or "127.0.0.1"
+        self.pending = (host, "")
+        self.ping, self.last_ping = None, 0.0
+        self.boxes = [TextBox((440, 250, 400, 48), "Servidor (IP o dirección:puerto)", host),
+                      TextBox((440, 340, 400, 48), "Usuario", str(cfg.get("user", ""))[:16], maxlen=16),
                       TextBox((440, 430, 400, 48), "Contraseña", "", secret=True, maxlen=64)]
         self.focus = 1
         self.btn_login = Button((440, 510, 195, 52), "Iniciar sesión", (52, 110, 190))
@@ -307,6 +327,7 @@ class App:
         host_txt, user, pw = self.boxes[0].text.strip(), self.boxes[1].text.strip(), self.boxes[2].text
         if not user or not pw:
             return self.set_status("Escribe usuario y contraseña", BAD)
+        self.pending = (host_txt, user)
         host, _, port = host_txt.partition(":")
         try:
             port = int(port) if port else DEFAULT_PORT
@@ -382,6 +403,7 @@ class App:
             elif t == "auth":
                 if m["ok"]:
                     self.user, self.stats = m["user"], m["stats"]
+                    save_config({"host": self.pending[0], "user": m["user"]})
                     self.scene = "menu"
                     self.set_status("")
                     self.net.send({"t": "modes"})
@@ -391,6 +413,11 @@ class App:
                 self.stats = m["stats"]
             elif t == "modes":
                 self.modes_info = m["rows"]
+            elif t == "pong":
+                rtt = (time.perf_counter() - m["c"]) * 1000.0
+                self.ping = rtt if self.ping is None else 0.7 * self.ping + 0.3 * rtt
+            elif t == "error":
+                self.set_status(m["msg"], BAD)
             elif t == "ranking":
                 self.ranking, self.rank_mode = m["rows"], m["mode"]
             elif t == "joined":
@@ -493,6 +520,9 @@ class App:
         if self.scene == "menu" and self.t - self.last_modes_poll > 2.0:
             self.last_modes_poll = self.t
             self.net.send({"t": "modes"})
+        if self.user and self.net.connected and self.t - self.last_ping > 2.0:
+            self.last_ping = self.t
+            self.net.send({"t": "ping", "c": time.perf_counter()})
         if self.scene != "game":
             return
         for d in self.players.values():
@@ -609,7 +639,7 @@ class App:
             self.text(r.get("name", key), self.f_big, (rect.x + 24, rect.y + 34), col)
             for i, ln in enumerate(wrap_text(r.get("desc", ""), self.f_m, rect.w - 48)):
                 self.text(ln, self.f_m, (rect.x + 24, rect.y + 100 + i * 28), TEXT)
-            self.text(f"{r.get('players', 0)} jugando  ·  meta {r.get('target', '?')} pts", self.f_m, (rect.x + 24, rect.bottom - 40), MUTED)
+            self.text(f"{r.get('players', 0)} jugando" + (f" (+{r['bots']} bots)" if r.get("bots") else "") + f"  ·  meta {r.get('target', '?')} pts", self.f_m, (rect.x + 24, rect.bottom - 40), MUTED)
         for b in (Button((70, 610, 220, 56), "Ranking", (52, 110, 190)), Button((310, 610, 160, 56), "Salir", (120, 50, 60))):
             self.draw_button(b, self.f_h)
         if self.status:
@@ -817,6 +847,9 @@ class App:
             line = f"{a}  [{wname}{' · HEADSHOT' if h else ''}]  {v}  (+{pts})"
             c = GOOD if am else (BAD if vm else TEXT)
             self.text(line, self.f_m, (W - 16, 16 + i * 24), c, "topright", True)
+        if self.ping is not None:
+            pc = GOOD if self.ping < 80 else (ACCENT if self.ping < 160 else BAD)
+            self.text(f"Ping {int(self.ping)} ms", self.f_s, (W - 12, H - 28), pc, "topright", True)
         me = self.players.get(self.my_id)
         # armas
         n = len(self.weapons)

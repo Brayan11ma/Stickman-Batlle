@@ -12,7 +12,7 @@ Modos (cada uno es una sala independiente):
   pvp     -> PvP clásico con armas de fuego y cuerpo a cuerpo (vida 100, headshot x2).
   melee   -> Solo armas cuerpo a cuerpo.
 
-Uso:  python server.py [--host 0.0.0.0] [--port 5555] [--db ruta.db]
+Uso:  python server.py [--host 0.0.0.0] [--port 5555] [--db ruta.db] [--bots 4] [--bot-skill 0.5]
 """
 import argparse
 import hashlib
@@ -55,6 +55,7 @@ MAX_HP = 100.0
 BASE_POINTS = 10
 HEAD_BONUS = 5
 RANGE = 1800.0
+MAX_PLAYERS = 12          # humanos por sala
 
 # (x, y_superior, ancho, alto). Todas son plataformas de "un solo sentido".
 PLATFORMS = [
@@ -177,6 +178,8 @@ class Database:
     def register(self, username, password):
         if not USER_RE.match(username):
             return False, "Usuario: 3-16 caracteres (letras, números o _)", None
+        if username.lower().startswith("bot_"):
+            return False, "Ese nombre está reservado para los bots", None
         if not (4 <= len(password) <= 64):
             return False, "La contraseña debe tener entre 4 y 64 caracteres", None
         with self.lock:
@@ -255,11 +258,115 @@ class Player:
         self.weapon = weapon
         self.streak = self.best = self.kills = self.hs = self.score = 0
         self.flushed = False
+        self.brain = None  # BotBrain si es un bot
+
+
+BOT_NAMES = ["Bot_Rex", "Bot_Nova", "Bot_Kira", "Bot_Zed", "Bot_Luna", "Bot_Hex", "Bot_Max", "Bot_Ivy"]
+PREFERRED_DIST = {"hs": 480, "pistol": 450, "smg": 350, "shotgun": 190, "sniper": 700}
+
+
+def angdiff(a, b):
+    return (a - b + math.pi) % (2 * math.pi) - math.pi
+
+
+class BotBrain:
+    """IA sencilla: persigue al enemigo más cercano, apunta con error y reacción humanos."""
+
+    def __init__(self, skill):
+        self.skill = skill
+        self.target_id = None
+        self.retarget = 0.0
+        self.reroll = 0.0
+        self.noise = (0.0, 0.0)
+        self.engage = 0.0
+        self.strafe = random.choice((-1, 1))
+        self.strafe_t = 0.0
+        self.jump_t = random.uniform(1.0, 3.0)
+        self.weapon_t = 0.0
+
+    def _pick_weapon(self, game, p, dist, now):
+        ws = game.mode["weapons"]
+        if len(ws) == 1:
+            p.weapon = ws[0]
+            return
+        if game.key == "melee":
+            choice = random.choice(ws)
+        elif dist > 650:
+            choice = random.choice(["sniper", "pistol", "smg"])
+        elif dist > 300:
+            choice = random.choice(["smg", "pistol", "sniper"])
+        elif dist > 120:
+            choice = random.choice(["shotgun", "smg", "sword"])
+        else:
+            choice = random.choice(["shotgun", "bat", "axe", "sword", "knife"])
+        if choice in ws and choice != p.weapon:
+            p.weapon = choice
+            p.next_shot = max(p.next_shot, now + 0.2)
+
+    def think(self, game, p, dt, now):
+        inp = p.inp
+        inp.update(l=False, r=False, j=False, d=False, fire=False)
+        if game.phase != "play" or not p.alive:
+            return
+        if now >= self.retarget:
+            self.retarget = now + random.uniform(0.6, 1.5)
+            cands = [q for q in game.players.values() if q is not p and q.alive and now >= q.protect_until]
+            self.target_id = min(cands, key=lambda q: math.hypot(q.x - p.x, q.y - p.y)).id if cands else None
+        q = game.players.get(self.target_id)
+        if q is None or not q.alive:
+            self.target_id, self.retarget = None, 0.0
+            return
+        dx, dy = q.x - p.x, q.y - p.y
+        dist = math.hypot(dx, dy)
+        if now >= self.weapon_t:
+            self.weapon_t = now + random.uniform(1.0, 2.5)
+            self._pick_weapon(game, p, dist, now)
+        w = WEAPONS[p.weapon]
+        melee = w["kind"] == "melee"
+        pref = w["reach"] * 0.6 if melee else PREFERRED_DIST.get(p.weapon, 400)
+        # movimiento
+        if now >= self.strafe_t:
+            self.strafe_t = now + random.uniform(0.8, 2.0)
+            self.strafe = random.choice((-1, 1))
+        if abs(dx) > pref + 40:
+            go = 1 if dx > 0 else -1
+        elif abs(dx) < pref - 80 and not melee:
+            go = -1 if dx > 0 else 1
+        else:
+            go = 0 if melee else self.strafe
+        inp["r"], inp["l"] = go > 0, go < 0
+        if p.on_ground:
+            if dy < -70 and abs(dx) < 260:
+                inp["j"] = True
+            elif now >= self.jump_t and not (melee and dist < w["reach"] + 60):
+                inp["j"] = True
+                self.jump_t = now + random.uniform(1.0, 3.0)
+            if dy > 70 and abs(dx) < 320:
+                inp["d"] = True
+        # puntería con error y giro limitado
+        r = game.head_r(q)
+        px, py = q.x, q.y - NECK_H - r * 0.4
+        if now >= self.reroll:
+            self.reroll = now + 0.3
+            sigma = (46 - 32 * self.skill) * (1 + dist / 900.0)
+            self.noise = (random.gauss(0, sigma), random.gauss(0, sigma))
+        want_a = math.atan2(py + self.noise[1] - (p.y - SHOULDER_H), px + self.noise[0] - p.x)
+        diff = angdiff(want_a, p.aim)
+        turn = (7 + 6 * self.skill) * dt
+        p.aim += max(-turn, min(turn, diff))
+        in_range = dist < ((w["reach"] + 8) if melee else w["rng"] * 0.9)
+        if in_range and abs(diff) < (0.5 if melee else 0.12):
+            self.engage += dt
+        else:
+            self.engage = max(0.0, self.engage - 2 * dt)
+        if self.engage > ((0.2 - 0.1 * self.skill) if melee else (0.55 - 0.35 * self.skill)):
+            inp["fire"] = True
 
 
 class Game:
-    def __init__(self, key, db, target=None):
+    def __init__(self, key, db, target=None, bot_fill=4, bot_skill=0.5):
         self.key, self.mode, self.db = key, MODES[key], db
+        self.bot_fill, self.bot_skill = bot_fill, bot_skill
         self.target = target or self.mode["target"]
         self.lock = threading.RLock()
         self.players = {}
@@ -280,7 +387,8 @@ class Game:
 
     def info(self):
         return {"id": self.key, "name": self.mode["name"], "desc": self.mode["desc"],
-                "players": len(self.players), "target": self.target}
+                "players": sum(1 for p in self.players.values() if p.brain is None),
+                "bots": sum(1 for p in self.players.values() if p.brain is not None), "target": self.target}
 
     def join_msg(self, pid):
         return {"t": "joined", "id": pid, "mode": self.key, "mname": self.mode["name"],
@@ -293,11 +401,14 @@ class Game:
     # --- jugadores --------------------------------------------------------
     def add(self, client, name):
         with self.lock:
+            if sum(1 for p in self.players.values() if p.brain is None) >= MAX_PLAYERS:
+                return None
             pid = self.next_id
             self.next_id += 1
             p = Player(pid, name, client, self.default_weapon())
             self.players[pid] = p
             self._spawn(p, time.monotonic())
+            self._balance_bots()
             return pid
 
     def remove(self, pid):
@@ -305,6 +416,27 @@ class Game:
             p = self.players.pop(pid, None)
             if p and not p.flushed and (p.score or p.kills):
                 self._flush(p, False)
+            self._balance_bots()
+
+    def _balance_bots(self):
+        """Rellena la sala con bots hasta `bot_fill` jugadores; se van al llegar humanos."""
+        humans = sum(1 for p in self.players.values() if p.brain is None)
+        want = max(0, self.bot_fill - humans) if humans > 0 else 0
+        bots = [p for p in self.players.values() if p.brain is not None]
+        now = time.monotonic()
+        while len(bots) < want:
+            used = {p.name for p in self.players.values()}
+            name = next((n for n in BOT_NAMES if n not in used), f"Bot_{self.next_id}")
+            b = Player(self.next_id, name, None, self.default_weapon())
+            self.next_id += 1
+            b.brain = BotBrain(self.bot_skill)
+            self.players[b.id] = b
+            self._spawn(b, now)
+            bots.append(b)
+        while len(bots) > want:
+            victim = min(bots, key=lambda b: b.score)
+            bots.remove(victim)
+            del self.players[victim.id]
 
     def set_input(self, pid, m):
         with self.lock:
@@ -343,6 +475,9 @@ class Game:
     def step(self, dt, now):
         with self.lock:
             playing = self.phase == "play"
+            for p in self.players.values():
+                if p.brain is not None:
+                    p.brain.think(self, p, dt, now)
             for p in self.players.values():
                 if not p.alive:
                     if playing and now >= p.respawn_at:
@@ -609,9 +744,16 @@ def handle_message(c, m, db):
     elif t == "join":
         key = m.get("mode")
         if key in GAMES and c.game is None:
-            c.game = GAMES[key]
-            c.pid = c.game.add(c, c.user)
-            c.send(c.game.join_msg(c.pid))
+            game = GAMES[key]
+            pid = game.add(c, c.user)
+            if pid is None:
+                c.send({"t": "error", "msg": f"La sala está llena ({MAX_PLAYERS} jugadores)"})
+            else:
+                c.game, c.pid = game, pid
+                c.send(game.join_msg(pid))
+    elif t == "ping":
+        if isinstance(m.get("c"), (int, float)):
+            c.send({"t": "pong", "c": m["c"]})
     elif t == "leave":
         c.leave_game()
         c.send({"t": "stats", "stats": db.stats(c.user)})
@@ -623,6 +765,17 @@ def handle_message(c, m, db):
                 "rows": db.ranking(mode if mode in MODES else "all")})
     elif t == "stats":
         c.send({"t": "stats", "stats": db.stats(c.user)})
+
+
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # no envía nada; solo elige la interfaz de red
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def serve_client(sock, addr, db):
@@ -682,11 +835,13 @@ def main():
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--target", type=int, default=None, help="puntos para ganar (anula todos los modos; útil para pruebas)")
+    ap.add_argument("--bots", type=int, default=4, help="rellena cada sala con bots hasta N jugadores (0 = sin bots)")
+    ap.add_argument("--bot-skill", type=float, default=0.5, help="habilidad de los bots, de 0 (torpes) a 1 (certeros)")
     args = ap.parse_args()
 
     db = Database(args.db)
     for key in MODES:
-        GAMES[key] = Game(key, db, args.target)
+        GAMES[key] = Game(key, db, args.target, max(0, args.bots), min(1.0, max(0.0, args.bot_skill)))
     threading.Thread(target=game_loop, daemon=True).start()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -694,6 +849,9 @@ def main():
     srv.bind((args.host, args.port))
     srv.listen(32)
     print(f"[server] escuchando en {args.host}:{args.port}  (db: {args.db})", flush=True)
+    print("[server] ¿Cómo se conectan tus amigos?", flush=True)
+    print(f"         · Misma red / VPN (Radmin, ZeroTier, Tailscale):  python client/client.py {lan_ip()}:{args.port}", flush=True)
+    print("         · Por internet sin VPN: túnel TCP (playit.gg) y comparte la dirección que te dé", flush=True)
     try:
         while True:
             sock, addr = srv.accept()

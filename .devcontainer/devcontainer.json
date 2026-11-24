@@ -1,0 +1,13 @@
+{
+  "name": "Stickman Power",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/desktop-lite:1": {}
+  },
+  "postCreateCommand": "pip install -r requirements.txt",
+  "forwardPorts": [6080, 5555],
+  "portsAttributes": {
+    "6080": { "label": "Escritorio (noVNC, clave: vscode)", "onAutoForward": "openBrowser" },
+    "5555": { "label": "Servidor del juego" }
+  }
+}
